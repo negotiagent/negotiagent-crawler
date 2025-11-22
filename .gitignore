@@ -23,7 +23,6 @@ crawled_data_est/
 *.json
 !package.json
 !tsconfig.json
-!manifest-*.json
 
 # Logs
 npm-debug.log*
