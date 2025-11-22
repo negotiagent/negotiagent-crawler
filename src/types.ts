@@ -4,6 +4,14 @@ export interface CrawlRequest {
   maxPages?: number; // Max pages to crawl to avoid infinite loops.
   excludePatterns?: string[]; // Regex patterns to exclude.
   includeUrls?: string[]; // Specific URLs to crawl (from manifest)
+  includeResources?: boolean; // Whether to download images/PDFs
+}
+
+export interface PageResource {
+  url: string;
+  type: 'image' | 'pdf' | 'other';
+  buffer: Buffer;
+  extension: string;
 }
 
 export interface PageResult {
@@ -13,5 +21,6 @@ export interface PageResult {
   html?: string; // Optional raw HTML
   metadata?: Record<string, any>;
   links: string[]; // Outgoing links found on the page
+  resources?: PageResource[];
 }
 

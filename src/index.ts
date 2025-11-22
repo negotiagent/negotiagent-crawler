@@ -11,6 +11,33 @@ function getUrlHash(url: string): string {
   return crypto.createHash("md5").update(url).digest("hex");
 }
 
+function getHierarchicalKey(url: string, domain: string): string {
+    try {
+        const parsed = new URL(url);
+        let pathname = parsed.pathname;
+        
+        // Ensure pathname starts with /
+        if (!pathname.startsWith('/')) pathname = '/' + pathname;
+        
+        // Remove trailing slash for the file/folder logic
+        if (pathname.endsWith('/') && pathname.length > 1) {
+            pathname = pathname.slice(0, -1);
+        }
+
+        // If root, name it index
+        if (pathname === '/') pathname = '/index';
+
+        // Construct path: domain/path/to/page.json
+        // Note: S3 keys shouldn't start with /
+        const fullPath = `${domain}${pathname}`;
+        
+        return fullPath;
+    } catch (e) {
+        // Fallback to hash if URL parsing fails
+        return `${domain}/${getUrlHash(url)}`;
+    }
+}
+
 async function main() {
   // Simple argument parsing
   const args = process.argv.slice(2);
@@ -22,9 +49,10 @@ async function main() {
   const profileArg = args.find(arg => arg.startsWith("--profile="));
   const discoverArg = args.includes("--discover");
   const manifestArg = args.find(arg => arg.startsWith("--manifest="));
+  const includeResourcesArg = args.includes("--include-resources");
 
   if (!urlArg && !manifestArg) {
-    console.error("Usage: node dist/index.js --url=<url> [--discover] [--manifest=<file>] [--bucket=<bucket> | --output-dir=<dir>] [--depth=<depth>] [--max-pages=<number>] [--profile=<profile>]");
+    console.error("Usage: node dist/index.js --url=<url> [--discover] [--manifest=<file>] [--bucket=<bucket> | --output-dir=<dir>] [--depth=<depth>] [--max-pages=<number>] [--profile=<profile>] [--include-resources]");
     process.exit(1);
   }
 
@@ -71,6 +99,7 @@ async function main() {
     url,
     depth,
     maxPages,
+    includeResources: includeResourcesArg
   };
 
   // If manifest provided, use it
@@ -81,9 +110,9 @@ async function main() {
           const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8'));
           if (manifest.urls && Array.isArray(manifest.urls)) {
               request.includeUrls = manifest.urls;
-              request.maxPages = manifest.urls.length; // Override maxPages to ensure we get everything in manifest
+              request.maxPages = manifest.urls.length; 
               if (!request.url && request.includeUrls && request.includeUrls.length > 0) {
-                  request.url = request.includeUrls[0]; // Fallback for Crawler constructor
+                  request.url = request.includeUrls[0]; 
               }
           }
       } else {
@@ -98,6 +127,7 @@ async function main() {
   }
 
   console.log(`Starting crawl for ${request.url} ${request.includeUrls ? '(Manifest Mode)' : `with depth ${depth} and max pages ${maxPages}`}`);
+  if (includeResourcesArg) console.log("Resource downloading enabled (Images/PDFs).");
 
   const crawler = new Crawler(request);
   const results = await crawler.crawl();
@@ -119,22 +149,52 @@ async function main() {
   }
 
   for (const result of results) {
-    const urlHash = getUrlHash(result.url);
-    const key = `${domain}/${urlHash}.json`;
+    // New Hierarchical Key Logic
+    // e.g. domain/global/en/products/excavators.json
+    const baseKey = getHierarchicalKey(result.url, domain);
+    const jsonKey = `${baseKey}.json`;
     
     const body = JSON.stringify({
         url: result.url,
         title: result.title,
         content: result.content,
         crawledAt: new Date().toISOString(),
+        // Include list of resources in JSON metadata
+        resources: result.resources?.map(r => ({ 
+            url: r.url, 
+            key: `${baseKey}_resources/${getUrlHash(r.url)}.${r.extension}`,
+            type: r.type 
+        }))
     }, null, 2);
 
     try {
       if (outputDir) {
-          fs.writeFileSync(path.join(outputDir, domain, `${urlHash}.json`), body);
+          const filePath = path.join(outputDir, jsonKey);
+          const fileDir = path.dirname(filePath);
+          if (!fs.existsSync(fileDir)) fs.mkdirSync(fileDir, { recursive: true });
+          fs.writeFileSync(filePath, body);
       } else if (bucket) {
-          await uploadToS3(bucket, key, body, "application/json");
+          await uploadToS3(bucket, jsonKey, body, "application/json");
       }
+
+      // Upload Resources
+      if (result.resources && result.resources.length > 0) {
+          console.log(`Processing ${result.resources.length} resources for ${result.url}...`);
+          for (const r of result.resources) {
+              const resourceKey = `${baseKey}_resources/${getUrlHash(r.url)}.${r.extension}`;
+              const contentType = r.type === 'pdf' ? 'application/pdf' : `image/${r.extension}`;
+              
+              if (outputDir) {
+                  const resPath = path.join(outputDir, resourceKey);
+                  const resDir = path.dirname(resPath);
+                  if (!fs.existsSync(resDir)) fs.mkdirSync(resDir, { recursive: true });
+                  fs.writeFileSync(resPath, r.buffer);
+              } else if (bucket) {
+                  await uploadToS3(bucket, resourceKey, r.buffer, contentType);
+              }
+          }
+      }
+
     } catch (e) {
       console.error(`Failed to save/upload ${result.url}:`, e);
     }

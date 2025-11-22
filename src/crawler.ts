@@ -1,6 +1,8 @@
 import { chromium, Browser, Page } from "playwright";
 import { URL } from "url";
-import { CrawlRequest, PageResult } from "./types";
+import { CrawlRequest, PageResult, PageResource } from "./types";
+import axios from 'axios';
+import * as path from 'path';
 
 export class Crawler {
   private visitedUrls: Set<string> = new Set();
@@ -90,6 +92,19 @@ export class Crawler {
         try {
           const response = await page.goto(current.url, { waitUntil: 'domcontentloaded', timeout: 30000 });
           
+          // Wait for product grid if it exists (heuristic for Hitachi site)
+          try {
+              // Wait a bit for dynamic content to settle
+              await page.waitForTimeout(2000);
+              
+              // If we are on a product list page, try to wait for the items
+              const productSelector = '.product-card, .product-item, .overview-list'; 
+              // (I'm guessing selectors here, but waiting for network idle is often safer for broad crawling)
+              await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+          } catch (e) {
+              // Ignore wait errors
+          }
+
           // Update base URL if this is the first page and it redirected
           // AND we are not in manifest mode (where we trust the URLs)
           if (pagesProcessed === 0 && response && !this.request.includeUrls) {
@@ -111,9 +126,15 @@ export class Crawler {
             const links = await this.extractLinks(page);
             for (const link of links) {
               const normalized = this.normalizeUrl(link);
+              // Ensure we are staying within the path prefix if started with a deep path
+              // Optional: we might want to enforce path prefix restriction more strictly
               if (this.isValidUrl(link) && !this.visitedUrls.has(normalized)) {
-                this.visitedUrls.add(normalized);
-                queue.push({ url: link, depth: current.depth + 1 });
+                // Simple check: if user started at /a/b/, only crawl things starting with /a/b/
+                // This is "sub-page" logic requested by user
+                if (link.startsWith(this.request.url)) {
+                     this.visitedUrls.add(normalized);
+                     queue.push({ url: link, depth: current.depth + 1 });
+                }
               }
             }
           }
@@ -142,12 +163,18 @@ export class Crawler {
     });
 
     const links = await this.extractLinks(page);
+    let resources: PageResource[] = [];
+
+    if (this.request.includeResources) {
+        resources = await this.extractResources(page, url);
+    }
 
     return {
       url,
       title,
       content,
-      links
+      links,
+      resources
     };
   }
 
@@ -159,5 +186,80 @@ export class Crawler {
         .filter(href => href.startsWith('http'));
     });
   }
-}
 
+  private async extractResources(page: Page, sourceUrl: string): Promise<PageResource[]> {
+      const resources: PageResource[] = [];
+      
+      // 1. Extract Image URLs (content images only, try to skip UI icons)
+      // Heuristic: Large images or images within article/main tags
+      const imageUrls = await page.evaluate(() => {
+          const imgs = Array.from(document.querySelectorAll('img'));
+          return imgs
+            .filter(img => {
+                // Basic filter for tiny icons
+                if (img.width < 50 || img.height < 50) return false;
+                return true;
+            })
+            .map(img => img.src);
+      });
+
+      // 2. Extract PDF Links
+      // Improved selector to catch PDFs by href extension OR by text content like "brochure"
+      const pdfUrls = await page.evaluate(() => {
+          const anchors = Array.from(document.querySelectorAll('a'));
+          return anchors
+              .filter(a => {
+                  const href = a.href.toLowerCase();
+                  const text = a.innerText.toLowerCase();
+                  // Check href for .pdf
+                  if (href.includes('.pdf')) return true;
+                  // Check for download attributes or common text
+                  if (text.includes('brochure') || text.includes('specifications') || text.includes('download')) {
+                       // Only if it looks like a file download link (heuristic)
+                       // Ideally we check headers, but we can't do that easily inside evaluate.
+                       // For now, let's assume these might be relevant and let the downloader filter by content-type
+                       return true; 
+                  }
+                  return false;
+              })
+              .map(a => a.href);
+      });
+
+      const allUrls = [...new Set([...imageUrls, ...pdfUrls])];
+
+      for (const url of allUrls) {
+          try {
+              if (!url.startsWith('http')) continue; // Skip data URIs etc for now
+              
+              const response = await axios.get(url, { responseType: 'arraybuffer', timeout: 10000 });
+              const contentType = response.headers['content-type'];
+              let type: 'image' | 'pdf' | 'other' = 'other';
+              let extension = '';
+
+              if (contentType?.includes('image')) {
+                  type = 'image';
+                  extension = contentType.split('/')[1] || 'jpg';
+              } else if (contentType?.includes('pdf')) {
+                  type = 'pdf';
+                  extension = 'pdf';
+              } else {
+                  // Fallback to extension from URL
+                  const ext = path.extname(url);
+                  if (ext) extension = ext.replace('.', '');
+              }
+
+              resources.push({
+                  url,
+                  type,
+                  buffer: Buffer.from(response.data),
+                  extension
+              });
+              
+          } catch (e) {
+            //   console.warn(`Failed to download resource ${url}`);
+          }
+      }
+      
+      return resources;
+  }
+}
